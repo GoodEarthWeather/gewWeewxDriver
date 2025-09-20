@@ -1,0 +1,611 @@
+#!/usr/bin/env python
+#
+# Copyright 2018 David McNeill
+#
+# See the file LICENSE.txt for your rights.
+
+
+"""Driver for Good Earth Weather GWS weather station
+
+"""
+
+from __future__ import with_statement
+import serial
+import syslog
+import time
+import struct
+import csv
+
+import weewx.drivers
+import weewx.wxformulas
+from weewx.units import INHG_PER_MBAR, MILE_PER_KM
+from weeutil.weeutil import timestamp_to_string
+
+DRIVER_NAME = 'GWS'
+DRIVER_VERSION = '0.1'
+
+
+def getSimplePacket(pkt, data):
+    '''
+    Parses the results from the first received packet with all measurements
+    '''
+    windSpeedOffset = 0.35  # meters/second
+    windSpeedGain = 0.758  # meters/second/Hertz
+    windSpeedSampleRate = 60.0  # 60 second wind speed sample rate
+    gustSpeedSampleRate = 5.0  # 5 second gust speed sample rate
+
+    h = pkt[3] * 125.0 / 65536.0 - 6.0
+    if h > 100.0:
+        h = 100.0
+    data['outHumidity'] = h
+    data['outTemp'] = (pkt[4] * 175.72 / 65536 - 46.85) * 1.8 + 32.0
+
+    count = pkt[5] * 1.0
+    speed = (windSpeedOffset + windSpeedGain *
+             (count / windSpeedSampleRate)) * 2.23693629
+    if speed < 1.0 or speed > 70.0:
+        speed = 0.0
+    data['windSpeed'] = speed
+    count = pkt[6] * 1.0
+    speed = (windSpeedOffset + windSpeedGain *
+             (count / gustSpeedSampleRate)) * 2.23693629
+    if speed < 1.0 or speed > 70.0:
+        speed = 0.0
+    data['windGust'] = speed
+    data['windDir'] = 4.0 + ((pkt[7] / 4096.0) - 1.0 / 102.0) * (359.04)
+    data['windGustDir'] = 4.0 + ((pkt[8] / 4096.0) - 1.0 / 102.0) * (359.04)
+    p = pkt[9]
+    if (p & 0x800000):
+        p = -((~p & 0xFFFFFF) + 1)  # convert two's complement number
+    data['pressure'] = (p / 4096.0) * 100.0 * 0.0002952998751
+    data['rain'] = pkt[10] * 0.01
+    #
+    # need to get etime
+    #
+    battery = (pkt[12] / 4096.0) * 1.2 * (4.57)
+    superCap = (pkt[13] / 4096.0) * 1.2 * (4.57)
+    vbatok = (pkt[14] / 4096.0) * 1.2 * (4.57)
+    if vbatok > 0.5:
+        data['supplyVoltage'] = superCap
+        data['referenceVoltage'] = (pkt[12] / 4096.0) * 1.2 * (3.0)
+    else:
+        data['supplyVoltage'] = battery
+        data['referenceVoltage'] = battery
+
+
+def getRain(pkt, data):
+    '''
+    The returned rain "count" is multiplied by the tipping bucket 
+    size - in this case 0.01 inch.  Note - put this value in a better place
+    '''
+    data['rain'] = pkt[3] * 0.01
+
+
+def getHT(pkt, command, data):
+    h = pkt[3] * 125.0 / 65536.0 - 6.0
+    t = (pkt[4] * 175.72 / 65536 - 46.85) * 1.8 + 32.0
+    if h > 100.0:
+        h = 100.0
+    if command == GWSDriver.cmdID['CMD_RTN_HT']:
+        data['outTemp'] = t
+        data['outHumidity'] = h
+    else:
+        data['inTemp'] = t
+        data['inHumidity'] = h
+
+
+def getHTP(pkt, data):
+    h = pkt[3] * 125.0 / 65536.0 - 6.0
+    t = (pkt[4] * 175.72 / 65536 - 46.85) * 1.8 + 32.0
+    if h > 100.0:
+        h = 100.0
+    data['outTemp'] = t
+    data['outHumidity'] = h
+    p = pkt[6]
+    if (p & 0x800000):
+        p = -((~p & 0xFFFFFF) + 1)  # convert two's complement number
+    data['pressure'] = (p / 4096.0) * 100.0 * 0.0002952998751
+
+
+def getPressure(pkt, data):
+    p = pkt[3]
+    if (p & 0x800000):
+        p = -((~p & 0xFFFFFF) + 1)  # convert two's complement number
+    data['pressure'] = (p / 4096.0) * 100.0 * 0.0002952998751
+
+
+def getPower(pkt, data):
+    battery = (pkt[3] / 4096.0) * 1.2 * (4.57)
+    superCap = (pkt[4] / 4096.0) * 1.2 * (4.57)
+    vbatok = (pkt[5] / 4096.0) * 1.2 * (4.57)
+    if vbatok > 0.5:
+        data['supplyVoltage'] = superCap
+        data['referenceVoltage'] = (pkt[3] / 4096.0) * 1.2 * (3.0)
+    else:
+        data['supplyVoltage'] = battery
+        data['referenceVoltage'] = battery
+
+
+def getWind(pkt, command, data):
+    '''
+    Should define these constants elsewhere
+    '''
+    windSpeedOffset = 0.35  # meters/second
+    windSpeedGain = 0.758  # meters/second/Hertz
+    windSpeedSampleRate = 60.0  # 60 second wind speed sample rate
+    gustSpeedSampleRate = 5.0  # 5 second wind speed sample rate
+    if command == GWSDriver.cmdID['CMD_RTN_WIND']:
+        offset = 0
+    elif command == GWSDriver.cmdID['CMD_NODE_READY']:
+        offset = 2
+    count = pkt[3 + offset] * 1.0
+    speed = (windSpeedOffset + windSpeedGain *
+             (count / windSpeedSampleRate)) * 2.23693629
+    if speed < 1.0:
+        speed = 0.0
+    data['windSpeed'] = speed
+    count = pkt[4 + offset] * 1.0
+    speed = (windSpeedOffset + windSpeedGain *
+             (count / gustSpeedSampleRate)) * 2.23693629
+    if speed < 1.0:
+        speed = 0.0
+    data['windGust'] = speed
+    dirCodeRatio = ((pkt[5 + offset] * 1.0) - 0.5) / \
+        ((pkt[10 + offset] * 1.0) - 0.5)
+    dirDegrees = 4.0 + (dirCodeRatio - 1.0 / 102.0) * (359.04)
+    gustDirCodeRatio = ((pkt[6 + offset] * 1.0) - 0.5) / \
+        ((pkt[11 + offset] * 1.0) - 0.5)
+    gustDirDegrees = 4.0 + (gustDirCodeRatio - 1.0 / 102.0) * (359.04)
+    data['windDir'] = dirDegrees
+    data['windGustDir'] = gustDirDegrees
+
+
+def getRSSI(pkt, command, data):
+    val = -((~pkt[3] & 0xFFFF) + 1)  # convert two's complement number
+    if command == GWSDriver.cmdID['CMD_RTN_NODE_RSSI']:
+        nodeLQI = pkt[4]
+        if nodeLQI >= 128:
+            nodeLQI -= 128
+        nodeLQI = (1.0 - nodeLQI / 127.0) * 100.0
+        data['rxCheckPercent'] = nodeLQI
+    elif command == GWSDriver.cmdID['CMD_RTN_HUB_RSSI']:
+        hubLQI = pkt[4]
+        if hubLQI >= 128:
+            hubLQI -= 128
+
+
+def getSysState(pkt, command):
+    etime = (int(time.time()))
+    headerList = ['timeOut', 'startTime', 'pktRXCount', 'pktTXCount',
+                  'crcErrorCount', 'lengthErrorCount', 'fifoErrorCount', 'retryCount', 'etime']
+    ssData = list(pkt[3:])
+    ssData.append(etime)
+    if command == GWSDriver.cmdID['CMD_RTN_NODE_SYS']:
+        with open('/home/fishineer/gew/myGWSLogs/nodeSysState.csv', 'a') as f:
+            fwrite = csv.writer(f)
+            # fwrite.writerow(headerList)
+            fwrite.writerow(ssData)
+    elif command == GWSDriver.cmdID['CMD_RTN_HUB_SYS']:
+        with open('/home/fishineer/gew/myGWSLogs/hubSysState.csv', 'a') as f:
+            fwrite = csv.writer(f)
+            # fwrite.writerow(headerList)
+            fwrite.writerow(ssData)
+
+
+def loader(config_dict, _):
+    return GWSDriver(**config_dict[DRIVER_NAME])
+
+
+def confeditor_loader():
+    return GWSConfEditor()
+
+
+def logmsg(level, msg):
+    syslog.syslog(level, 'gws: %s' % msg)
+
+
+def logdbg(msg):
+    logmsg(syslog.LOG_DEBUG, msg)
+
+
+def loginf(msg):
+    logmsg(syslog.LOG_INFO, msg)
+
+
+def logerr(msg):
+    logmsg(syslog.LOG_ERR, msg)
+
+
+class GWSDriver(weewx.drivers.AbstractDevice):
+    """weewx driver that communicates with a Goodearth Weather Station
+
+    model: station model
+    [Optional. Default is 'GWS']
+
+    port - serial port
+    [Required. Default is /dev/ttyUSB0]
+
+    max_tries - how often to retry serial communication before giving up
+    [Optional. Default is 5]
+    """
+    # definitions for ID
+    NODE_ID = 0xFE
+    HUB_ID = 0x01
+
+    '''
+    Command dictionaries
+    A command is defined by 3 items - command name, command id,
+    and the command format.
+    Two dictionaries are defined for handling commands -
+    cmdID - where the key is the command name and the value is the command ID
+    cmdFormat - where the key is the command ID, and the value is the decoder for the packet data format
+    
+    A "command" can be more accurately defined as a "packet ID" - i.e. every packet sent between console,
+    hub and node all follow a defined format that includes an ID that identifies the contents of the packet.
+    '''
+    cmdID = {}
+    cmdFormat = {}
+
+    # define commands
+    cmdID['CMD_NULL'] = 0
+    cmdID['CMD_NODE_READY'] = 1
+    cmdID['CMD_REQ_HT'] = 2
+    cmdID['CMD_RTN_HT'] = 3
+    cmdID['CMD_REQ_WIND'] = 4
+    cmdID['CMD_RTN_WIND'] = 5
+    cmdID['CMD_REQ_RAIN'] = 6
+    cmdID['CMD_RTN_RAIN'] = 7
+    cmdID['CMD_REQ_POWER'] = 8
+    cmdID['CMD_RTN_POWER'] = 9
+    cmdID['CMD_REQ_HTP'] = 10
+    cmdID['CMD_RTN_HTP'] = 11
+    cmdID['CMD_SET_NODE_ETIME'] = 12
+    cmdID['CMD_REQ_NODE_ETIME'] = 13
+    cmdID['CMD_RTN_NODE_ETIME'] = 14
+    cmdID['CMD_SET_SLEEP'] = 15
+    cmdID['CMD_REQ_PRESSURE'] = 16
+    cmdID['CMD_RTN_PRESSURE'] = 17
+    cmdID['CMD_SET_RFID'] = 18
+    cmdID['CMD_REQ_NODE_RSSI'] = 19
+    cmdID['CMD_RTN_NODE_RSSI'] = 20
+    cmdID['CMD_ACK'] = 21
+    cmdID['CMD_SET_HUB_ETIME'] = 22
+    cmdID['CMD_SET_CMDLIST'] = 23   # length is variable
+    cmdID['CMD_ENDRESPONSE'] = 24
+    cmdID['CMD_REQ_HUB_RSSI'] = 25
+    cmdID['CMD_RTN_HUB_RSSI'] = 26
+    cmdID['CMD_REQ_NODE_SYS'] = 27
+    cmdID['CMD_RTN_NODE_SYS'] = 28
+    cmdID['CMD_REQ_HUB_SYS'] = 29
+    cmdID['CMD_RTN_HUB_SYS'] = 30
+    cmdID['CMD_CLR_NODE_SYS'] = 31
+    cmdID['CMD_CLR_HUB_SYS'] = 32
+    cmdID['CMD_SET_WAKEUP'] = 33
+    cmdID['CMD_REQ_CLR_RAIN'] = 34
+    cmdID['CMD_SET_AUTO_CMDLIST'] = 35  # length is variable
+    cmdID['CMD_REQ_IHT'] = 36
+    cmdID['CMD_RTN_IHT'] = 37
+    cmdID['CMD_SET_HUB_RESET'] = 38
+    cmdID['CMD_SET_NODE_RESET'] = 39
+    cmdID['CMD_REQ_SIMPLE'] = 40
+    cmdID['CMD_RTN_SIMPLE'] = 41
+
+    cmdFormat[0] = '=3B'  # 'CMD_NULL'
+    cmdFormat[1] = '=5B'  # 'CMD_NODE_READY'
+    cmdFormat[2] = '=3B'  # 'CMD_REQ_HT'
+    cmdFormat[3] = '=3BHHL'  # 'CMD_RTN_HT'
+    cmdFormat[4] = '=3B'  # 'CMD_REQ_WIND'
+    cmdFormat[5] = '=3B4H3L2H'  # 'CMD_RTN_WIND'
+    cmdFormat[6] = '=4B'  # 'CMD_REQ_RAIN'
+    cmdFormat[7] = '=4BL'  # 'CMD_RTN_RAIN'
+    cmdFormat[8] = '=3B'  # 'CMD_REQ_POWER'
+    cmdFormat[9] = '=3B3HL'  # 'CMD_RTN_POWER'
+    cmdFormat[10] = '=3B'  # 'CMD_REQ_HTP'
+    cmdFormat[11] = '=3BHHLLL'  # 'CMD_RTN_HTP'
+    cmdFormat[12] = '=3BL'  # 'CMD_SET_NODE_ETIME'
+    cmdFormat[13] = '=3B'  # 'CMD_REQ_NODE_ETIME'
+    cmdFormat[14] = '=3BL'  # 'CMD_RTN_NODE_ETIME'
+    cmdFormat[15] = '=3B'  # 'CMD_SET_SLEEP'
+    cmdFormat[16] = '=3B'  # 'CMD_REQ_PRESSURE'
+    cmdFormat[17] = '=3BL'  # 'CMD_RTN_PRESSURE'
+    cmdFormat[18] = '=5B'  # 'CMD_SET_RFID'
+    cmdFormat[19] = '=3B'  # 'CMD_REQ_NODE_RSSI'
+    cmdFormat[20] = '=3BHB'  # 'CMD_RTN_NODE_RSSI'
+    cmdFormat[21] = '=3B'  # 'CMD_ACK'
+    cmdFormat[22] = '=3BL'  # 'CMD_SET_HUB_ETIME'
+    cmdFormat[23] = ''  # 'CMD_SET_CMDLIST'   # length is variable
+    cmdFormat[24] = '=3B'  # 'CMD_ENDRESPONSE'
+    cmdFormat[25] = '=3B'  # 'CMD_REQ_HUB_RSSI'
+    cmdFormat[26] = '=3BHB'  # 'CMD_RTN_HUB_RSSI'
+    cmdFormat[27] = '=3B'  # 'CMD_REQ_NODE_SYS'
+    cmdFormat[28] = '=3BHL6H'  # 'CMD_RTN_NODE_SYS'
+    cmdFormat[29] = '=3B'  # 'CMD_REQ_HUB_SYS'
+    cmdFormat[30] = '=3BHL6H'  # 'CMD_RTN_HUB_SYS'
+    cmdFormat[31] = '=3B'  # 'CMD_CLR_NODE_SYS'
+    cmdFormat[32] = '=3B'  # 'CMD_CLR_HUB_SYS'
+    cmdFormat[33] = '=4B'  # 'CMD_SET_WAKEUP'
+    cmdFormat[34] = '=4B'  # 'CMD_REQ_CLR_RAIN'
+    cmdFormat[35] = ''  # 'CMD_SET_AUTO_CMDLIST'  # length is variable
+    cmdFormat[36] = '=3B'  # 'CMD_REQ_IHT'
+    cmdFormat[37] = '=3BHHL'  # 'CMD_RTN_IHT'
+    cmdFormat[38] = '=3B'  # 'CMD_SET_HUB_RESET'
+    cmdFormat[39] = '=3B'  # 'CMD_SET_NODE_RESET'
+    cmdFormat[40] = '=3B'  # 'CMD_REQ_SIMPLE'
+    cmdFormat[41] = '=3B6HLBL3H'  # 'CMD_RTN_SIMPLE'
+
+    pkt5_counter = 0
+    pkt1440_counter = 0
+
+    def __init__(self, **stn_dict):
+        self.model = stn_dict.get('model', 'GWS')
+        self.port = stn_dict.get('port', Station.DEFAULT_PORT)
+        self.max_tries = int(stn_dict.get('max_tries', 5))
+        self.retry_wait = int(stn_dict.get('retry_wait', 3))
+        debug_serial = int(stn_dict.get('debug_serial', 0))
+        self.last_rain = None
+
+        loginf('driver version is %s' % DRIVER_VERSION)
+        loginf('using serial port %s' % self.port)
+        self.station = Station(self.port, debug_serial=debug_serial)
+        self.station.open()
+
+    def closePort(self):
+        if self.station is not None:
+            self.station.close()
+            self.station = None
+
+    @property
+    def hardware_name(self):
+        return self.model
+
+    def getTime(self):
+        return self.station.get_time()
+
+    def setTime(self):
+        self.station.set_time(int(time.time()))
+
+    def genLoopPackets(self):
+        sysStateCounter = 0
+        while True:
+            data = {'dateTime': int(time.time() + 0.5),
+                    'usUnits': weewx.US}
+            command = GWSDriver.cmdID['CMD_NULL']
+            '''
+            Loop through all packets until an ENDRESPONSE command is received, indicating
+            the end of the response packets.
+            '''
+            while command != GWSDriver.cmdID['CMD_ENDRESPONSE']:
+                nodeOffsetFlag = 0
+                packet = self.station.get_packet_with_retry(
+                    self.max_tries, self.retry_wait)
+                try:
+                    command = ord(packet[2])
+                except:
+                    break
+                if command > 41:
+                    break
+                try:
+                    pkt = struct.unpack_from(
+                        GWSDriver.cmdFormat[command], packet)
+                except:
+                    break
+                if command == GWSDriver.cmdID['CMD_RTN_HT'] or command == GWSDriver.cmdID['CMD_RTN_IHT']:
+                    getHT(pkt, command, data)
+                elif (command == GWSDriver.cmdID['CMD_RTN_WIND']):
+                    getWind(pkt, command, data)
+                elif (command == GWSDriver.cmdID['CMD_RTN_SIMPLE']):
+                    getSimplePacket(pkt, data)
+                elif command == GWSDriver.cmdID['CMD_RTN_HTP']:
+                    getHTP(pkt, data)
+                elif command == GWSDriver.cmdID['CMD_RTN_POWER']:
+                    getPower(pkt, data)
+                elif command == GWSDriver.cmdID['CMD_RTN_RAIN']:
+                    getRain(pkt, data)
+                elif command == GWSDriver.cmdID['CMD_RTN_PRESSURE']:
+                    getPressure(pkt, data)
+                elif command == GWSDriver.cmdID['CMD_RTN_NODE_ETIME']:
+                    nodeOffsetFlag = 1
+                    tempNodeOffset = pkt
+                elif (command == GWSDriver.cmdID['CMD_RTN_NODE_RSSI']) or (command == GWSDriver.cmdID['CMD_RTN_HUB_RSSI']):
+                    getRSSI(pkt, command, data)
+                elif (command == GWSDriver.cmdID['CMD_RTN_NODE_SYS']) or (command == GWSDriver.cmdID['CMD_RTN_HUB_SYS']):
+                    getSysState(pkt, command)
+            # if node offset flag was set, correct time
+            if nodeOffsetFlag == 1:
+                self.setNodeETimeOffset(tempNodeOffset)
+                nodeOffsetFlag = 0
+            '''
+            Every 5 transactions (nominally every 5 minutes), send requests for hub and node
+            system status and rssi values.  Also, request the indoor temp/humidity from hub.
+            These requests are sent to the hub, which performs the commands and stores the results
+            which will be sent back the next time the node wakes up.
+            
+            GWSDriver.pkt5_counter += 1
+            if GWSDriver.pkt5_counter == 5:
+                GWSDriver.pkt5_counter = 0
+                c = [2, GWSDriver.NODE_ID, GWSDriver.cmdID['CMD_REQ_IHT']]
+                self.station.serial_port.write(c)
+            
+            GWSDriver.pkt1440_counter += 1
+            if GWSDriver.pkt1440_counter == 1440:  # every 24 hours request system status from hub and node
+                GWSDriver.pkt1440_counter = 0
+                c = [3, GWSDriver.NODE_ID, GWSDriver.cmdID['CMD_SET_CMDLIST'],
+                     GWSDriver.cmdID['CMD_REQ_NODE_SYS']]
+                self.station.serial_port.write(c)
+                c = [2, GWSDriver.NODE_ID, GWSDriver.cmdID['CMD_REQ_HUB_SYS']]
+                self.station.serial_port.write(c)
+            '''
+
+            # flush input buffer
+            self.station.serial_port.reset_input_buffer()
+            yield data
+
+    def setNodeETimeOffset(self, pkt):
+        '''
+        On each loop, the node etime value is returned.  This function keeps
+        track of the difference between the node etime and the actual epoch time.
+        Whenever weewx requests the current node etime, it is calculated from this
+        offset value and returned.  The reason for this is that the node is only
+        accessible every 60 seconds, so this scheme allows immediate return of the
+        node time without the delay.
+        '''
+        self.station.nodeTimeOffset = int(
+            time.time()) - pkt[3]  # current time minus node time
+        # check to see if node has been reset (i.e epoch time reset to 0)
+        # if so, re-send the node time
+        if self.station.nodeTimeOffset > 1000000000:
+            # send command to set current time on hub and node
+            #
+            self.station.set_time(int(time.time()))
+            #'Detected a reset on node (epoch time too low); re-setting time on hub/node'
+
+
+class Station(object):
+
+    DEFAULT_PORT = '/dev/ttyUSB0'
+
+    def __init__(self, port, debug_serial=0):
+        self._debug_serial = debug_serial
+        self.port = port
+        self.baudrate = 19200
+        self.timeout = 60  # seconds
+        self.serial_port = None
+        self.nodeTimeOffset = 0
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, _, value, traceback):
+        self.close()
+
+    def open(self):
+        logdbg("open serial port %s" % self.port)
+        self.serial_port = serial.Serial(self.port, self.baudrate,
+                                         timeout=self.timeout)
+        self.serial_port.xonoff = True
+
+        self.send_autolist_commands()
+
+    def send_autolist_commands(self):
+        '''
+        The auto command list command sends a list of commands to the hub.  These commands are then
+        automatically sent to the node each time the node wakes up and requests for commands.  This
+        sets the basic measurements or tasks that the node will do each time it wakes up.
+        This allows the repeated functionality of the node to be defined as needed or desired.
+        '''
+        # set the auto command list on the hub
+        '''
+        c = [6, GWSDriver.NODE_ID, GWSDriver.cmdID['CMD_SET_AUTO_CMDLIST'],
+             GWSDriver.cmdID['CMD_REQ_HTP'], GWSDriver.cmdID['CMD_REQ_CLR_RAIN'], GWSDriver.cmdID['CMD_REQ_POWER'], GWSDriver.cmdID['CMD_REQ_NODE_ETIME']]
+        self.serial_port.write(c)  # send auto command list
+        '''
+        c = [5, GWSDriver.NODE_ID, GWSDriver.cmdID['CMD_SET_AUTO_CMDLIST'],
+             GWSDriver.cmdID['CMD_REQ_NODE_ETIME'], GWSDriver.cmdID['CMD_REQ_SIMPLE'], GWSDriver.cmdID['CMD_REQ_NODE_RSSI']]
+        self.serial_port.write(c)  # send auto command list
+
+    def close(self):
+        if self.serial_port is not None:
+            logdbg("close serial port %s" % self.port)
+            self.serial_port.close()
+            self.serial_port = None
+
+    def get_time(self):
+        try:
+            ts = int(time.time() + 0.5) - \
+                self.nodeTimeOffset  # current time minus offset
+            logdbg("station time: %s" % str(time.asctime(time.localtime(ts))))
+            return ts
+        except (serial.serialutil.SerialException, weewx.WeeWxIOError), e:
+            logerr("get_time failed: %s" % e)
+        return int(time.time())
+
+    def set_time(self, ts):
+        b1 = ts & 255
+        b2 = (ts >> 8) & 255
+        b3 = (ts >> 16) & 255
+        b4 = (ts >> 24) & 255
+        c = [6, GWSDriver.NODE_ID,
+             GWSDriver.cmdID['CMD_SET_HUB_ETIME'], b1, b2, b3, b4]
+        logdbg("set station time to %s" % (timestamp_to_string(ts)))
+        self.serial_port.write(c)
+        # now send command to update node time
+        c = [3, GWSDriver.NODE_ID, GWSDriver.cmdID['CMD_SET_CMDLIST'],
+             GWSDriver.cmdID['CMD_SET_NODE_ETIME']]
+        self.serial_port.write(c)
+
+    def get_packet_with_retry(self, max_tries=5, retry_wait=3):
+        for ntries in range(0, max_tries):
+            try:
+                length = self.serial_port.read(1)
+                result = length
+                try:
+                    result += self.serial_port.read(ord(length))
+                except TypeError:
+                    return 0
+                else:
+                    return result
+            except (serial.serialutil.SerialException, weewx.WeeWxIOError), e:
+                loginf("Failed attempt %d of %d to get readings: %s" %
+                       (ntries + 1, max_tries, e))
+                time.sleep(retry_wait)
+        else:
+            msg = "Max retries (%d) exceeded for readings" % max_tries
+            logerr(msg)
+            raise weewx.RetriesExceeded(msg)
+
+
+class GWSConfEditor(weewx.drivers.AbstractConfEditor):
+    @property
+    def default_stanza(self):
+        return """
+[Ultimeter]
+    # This section is for the Goodearth Weather GWS series of weather stations.
+
+    # Serial port such as /dev/ttyS0, /dev/ttyUSB0, or /dev/cua0
+    port = %s
+
+    # The station model, 
+    model = GWS
+
+    # The driver to use:
+    driver = weewx.drivers.gws
+""" % Station.DEFAULT_PORT
+
+    def prompt_for_settings(self):
+        print "Specify the serial port on which the station is connected, for"
+        print "example: /dev/ttyUSB0 or /dev/ttyS0 or /dev/cua0."
+        port = self._prompt('port', Station.DEFAULT_PORT)
+        return {'port': port}
+
+
+# define a main entry point for basic testing of the station without weewx
+# engine and service overhead.  invoke this as follows from the weewx root dir:
+#
+# PYTHONPATH=bin python bin/weewx/drivers/ultimeter.py
+
+if __name__ == '__main__':
+    import optparse
+
+    usage = """%prog [options] [--help]"""
+
+    syslog.openlog('gws', syslog.LOG_PID | syslog.LOG_CONS)
+    syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_DEBUG))
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option('--version', dest='version', action='store_true',
+                      help='display driver version')
+    parser.add_option('--debug', dest='debug', action='store_true',
+                      help='provide additional debug output in log')
+    parser.add_option('--port', dest='port', metavar='PORT',
+                      help='serial port to which the station is connected',
+                      default=Station.DEFAULT_PORT)
+    (options, args) = parser.parse_args()
+
+    if options.version:
+        print "gws driver version %s" % DRIVER_VERSION
+        exit(0)
+'''
+    with Station(options.port, debug_serial=options.debug) as station:
+        while True:
+            print time.time(), _fmt(station.get_readings())
+'''
